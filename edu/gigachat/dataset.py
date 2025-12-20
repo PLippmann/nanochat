@@ -4,16 +4,17 @@ import os
 import requests
 import time
 from multiprocessing import Pool
+from tqdm import tqdm
 
 BASE_URL = "https://huggingface.co/datasets/karpathy/fineweb-edu-100b-shuffle/resolve/main/" # shard_00000.parquet
 MAX_SHARD = 1822 # the last datashard is shard_01822.parquet
 SAVE_LOCATION = "./edu/gigachat/data/"
 MAX_RETRIES = 5
-NUM_WORKERS = 16
+NUM_WORKERS = 8
 
 def load_shard(shard_id):
     # Check if file exists, if not download it with backoff
-    print(f"Downloading shard {shard_id}")
+    #print(f"Downloading shard {shard_id}")
     destination = SAVE_LOCATION + "shard_" + f"{shard_id:05d}" + ".parquet" # ShardID starts with 00000
     temp_destination = destination + ".tmp"
 
@@ -30,7 +31,7 @@ def load_shard(shard_id):
                     if chunk:
                         f.write(chunk)
             os.rename(temp_destination, destination)
-            print(f"Downloaded shard {shard_id}. Success!")
+            #print(f"Downloaded shard {shard_id}. Success!")
             return True
         except requests.exceptions.RequestException as e:
             print(f"Attempt {attempt + 1} failed: {e}")
@@ -51,7 +52,11 @@ if __name__ == "__main__":
     
     start_time = time.time()
     with Pool(processes=NUM_WORKERS) as pool:
-        results = pool.map(load_shard, range(MAX_SHARD + 1))
+        results = list(tqdm(
+            pool.imap(load_shard, range(MAX_SHARD + 1)), # imap plays nicer with tqdm than map
+            total=MAX_SHARD + 1, 
+            desc="Downloading"
+        ))
     end_time = time.time()
 
     print(f"Done! Downloaded {sum(results)} shards out of {MAX_SHARD + 1} in {(end_time - start_time) / 60:.2f} minutes.")
