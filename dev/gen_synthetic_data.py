@@ -37,9 +37,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from nanochat.common import get_base_dir
 
-api_key = open("openroutertoken.txt", "r", encoding="utf-8").read().strip()
-
-url = "https://openrouter.ai/api/v1/chat/completions"
+api_key = (os.environ.get("DEEPSEEK_API_KEY") or open("deepseektoken.txt", "r", encoding="utf-8").read().strip())
+           
+url = "https://api.deepseek.com/chat/completions"
 headers = {
   "Authorization": f"Bearer {api_key}",
   "Content-Type": "application/json"
@@ -60,6 +60,16 @@ Next, I am attaching the README just to give you more context on the project:
 Ok and now finally, I want you to create an example multi-turn conversation between a User and an Assistant. I will SFT finetune the LLM on this data to teach it about its identity. Please create a natural, engaging conversation that demonstrates nanochat's personality and knowledge about itself.
 
 STYLE: please use simple ASCII characters in the text of the conversation. No emojis, special characters, or etc., just plain text.
+
+OUTPUT FORMAT (json):
+- Return ONLY a single JSON object (no markdown / no code fences / no extra text).
+- The JSON must have this shape:
+  {
+    "messages": [
+      {"role": "user", "content": "..."},
+      {"role": "assistant", "content": "..."}
+    ]
+  }
 
 Here are some examples of user first messages, basically we want them nice and diverse:
 
@@ -274,48 +284,18 @@ ahoj, jak se máš
 
 prompt = prompt.replace("%README%", readme)
 
-# Define the JSON schema for structured output
-response_format = {
-  "type": "json_schema",
-  "json_schema": {
-    "name": "conversation",
-    "strict": True,
-    "schema": {
-      "type": "object",
-      "properties": {
-        "messages": {
-          "type": "array",
-          "description": "A list of conversation messages alternating between user and assistant, with the first message being a user message",
-          "items": {
-            "type": "object",
-            "properties": {
-              "role": {
-                "type": "string",
-                "description": "The role of the speaker, either 'user' or 'assistant'"
-              },
-              "content": {
-                "type": "string",
-                "description": "The message content"
-              }
-            },
-            "required": ["role", "content"],
-            "additionalProperties": False
-          }
-        }
-      },
-      "required": ["messages"],
-      "additionalProperties": False
-    }
-  }
-}
+# DeepSeek JSON Output mode (guarantees valid JSON string)
+response_format = {"type": "json_object"}
 
 # Sadly it doesn't seem like Chat completions support `n`
 # to generate multiple completions per prompt.
 base_payload = {
-  "model": "google/gemini-2.5-flash",
+  # DeepSeek-V3.2 (non-thinking). Use "deepseek-reasoner" or thinking={"type":"enabled"} for thinking mode.
+  "model": "deepseek-chat",  
   "stream": False,
   "response_format": response_format,
   "temperature": 1.0,
+  "max_tokens": 4096, # Set reasonably to avoid truncating JSON.
 }
 
 def generate_conversation(idx: int):
@@ -332,8 +312,12 @@ def generate_conversation(idx: int):
     payload['messages'] = [{"role": "user", "content": modified_prompt}]
 
     response = requests.post(url, headers=headers, json=payload)
+    response.raise_for_status()
     result = response.json()
     content = result['choices'][0]['message']['content']
+    if not content or not content.strip():
+        # DeepSeek docs note JSON Output may occasionally return empty content.
+        raise RuntimeError(f"Empty model content. Full response: {result}")
 
     # Parse the JSON response and unpack the messages
     conversation_data = json.loads(content)
@@ -344,7 +328,7 @@ def generate_conversation(idx: int):
 
 # Configuration
 num_conversations = 1000
-num_workers = 4
+num_workers = 32
 
 output_file = os.path.join(get_base_dir(), "identity_conversations.jsonl")
 # Wipe the file clean first to reset it
