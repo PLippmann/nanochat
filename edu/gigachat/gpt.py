@@ -51,28 +51,35 @@ class CausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
 
-    def forward(self, x, cos, sin):
+    def forward(self, x, cos, sin, kv_cache=None):
         B, T, C = x.shape
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
 
         # QK rotary embedding (RoPE)
-        # cos/sin are (1, T, 1, D), need to handle broadcasting or slicing
-        # Here we slice to T in case we have a shorter sequence during inference
-        cos, sin = cos[:, :T, :, :], sin[:, :T, :, :]
         # apply_rotary_emb expects (B, T, H, D)
         q = apply_rotary_emb(q.transpose(1, 2), cos, sin).transpose(1, 2)
         k = apply_rotary_emb(k.transpose(1, 2), cos, sin).transpose(1, 2)
 
-        # QK norm (using native rms_norm)
+        # QK norm
         # F.rms_norm expects the last dim to be the norm dim
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
 
+        if kv_cache is not None:
+            k, v = kv_cache.insert_kv(self.layer_idx, k, v)
+
         # Native GQA support
         enable_gqa = self.n_head != self.n_kv_head
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
+        Tq = q.size(2)  # Number of new queries
+        Tk = k.size(2)  # Total keys (cached + new)
+        if kv_cache is None or Tq == Tk:
+            # Training or prefill: standard causal attention
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
+        elif Tq == 1:
+            # Single token decode: attend to all cached keys (no masking needed)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
 
         # Re-assemble the heads side by side and project back to residual stream
         y = y.transpose(1, 2).contiguous().view(B, T, C)
@@ -99,8 +106,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, cos, sin):
-        x = x + self.attn(rms_norm(x), cos, sin)
+    def forward(self, x, cos, sin, kv_cache=None):
+        x = x + self.attn(rms_norm(x), cos, sin, kv_cache=kv_cache)
         x = x + self.mlp(rms_norm(x))
         return x
 
@@ -115,6 +122,8 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # Weight tying: share weights between embedding and output projection
+        self.lm_head.weight = self.transformer["wte"].weight
         cos, sin = self._precompute_freqs(head_dim, config.sequence_len, device=device)
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
@@ -156,11 +165,20 @@ class GPT(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
-    def forward(self, x, targets=None):
+    def forward(self, x, targets=None, kv_cache=None):
+        B, T = x.shape
         x = self.transformer["wte"](x)
         x = rms_norm(x)
+
+        # Offset RoPE based on cache position
+        # cos/sin are (1, T, 1, D), need to handle broadcasting or slicing
+        # Here we slice to T in case we have a shorter sequence during inference
+        T0 = 0 if kv_cache is None else kv_cache.get_pos()
+        cos = self.cos[:, T0:T0+T, :, :]
+        sin = self.sin[:, T0:T0+T, :, :]
+
         for block in self.transformer["h"]:
-            x = block(x, self.cos, self.sin)
+            x = block(x, cos, sin, kv_cache=kv_cache)
         x = rms_norm(x)
         x = self.lm_head(x) # Logits
         
@@ -175,7 +193,9 @@ class GPT(nn.Module):
         device = self.get_device()
         x = torch.tensor([x], dtype=torch.long, device=device) # add batch dim
         for _ in range(max_new_tokens):
-            logits = self.forward(x) # (B, T, vocab_size)
+            # Handle context overflow: only use last sequence_len tokens
+            x_cond = x if x.size(1) <= self.config.sequence_len else x[:, -self.config.sequence_len:]
+            logits = self.forward(x_cond) # (B, T, vocab_size)
             logits = logits[:, -1, :] # (B, vocab_size)
             if top_k > 0:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
