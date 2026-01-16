@@ -54,43 +54,19 @@ class Engine:
         )
 
     def prefill(self, tokens):
-        """Process the prompt tokens in one forward pass, populating the KV cache.
-        
-        Args:
-            tokens: Tensor of shape (B, T) containing prompt token IDs
-            
-        Returns:
-            Logits for the last position (B, vocab_size)
-        """
+        """Process the prompt tokens in one forward pass, populating the KV cache."""
         self.kv_cache.reset()
         logits = self.model(tokens, kv_cache=self.kv_cache)  # (B, T, vocab_size)
         return logits[:, -1, :]  # Only need last position for next token prediction
 
     def decode(self, token):
-        """Process a single token, using and updating the KV cache.
-        
-        Args:
-            token: Tensor of shape (B, 1) containing a single token ID
-            
-        Returns:
-            Logits for this position (B, vocab_size)
-        """
+        """Process a single token, using and updating the KV cache."""
         logits = self.model(token, kv_cache=self.kv_cache)  # (B, 1, vocab_size)
         return logits[:, -1, :]  # (B, vocab_size)
 
     @torch.inference_mode()
     def generate(self, prompt_tokens, max_new_tokens=100, temperature=1.0, top_k=0):
-        """Generate tokens autoregressively using the KV cache.
-        
-        Args:
-            prompt_tokens: List of token IDs for the prompt
-            max_new_tokens: Maximum number of tokens to generate
-            temperature: Sampling temperature (0 = greedy)
-            top_k: If > 0, only sample from top-k most likely tokens
-            
-        Yields:
-            Generated token IDs one at a time
-        """
+        """Generate tokens autoregressively using the KV cache."""
         device = self.model.get_device()
         tokens = torch.tensor([prompt_tokens], dtype=torch.long, device=device)  # (1, T)
         

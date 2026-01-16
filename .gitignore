@@ -6,4 +6,4 @@ dev-ignore/
 report.md
 eval_bundle/
 deepseektoken.txt
-edu/gigachat/data/
+*.jsonl
